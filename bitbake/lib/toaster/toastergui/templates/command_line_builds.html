@@ -7,6 +7,12 @@
 {% block pagecontent %}
 
 <div class="container-fluid">
+    <div id="overlay" class="hide">
+        <div class="spinner">
+            <div class="fa-spin">
+            </div>
+        </div>
+    </div>
     <div class="row">
         <div class="col-md-12">
             <div class="page-header">
@@ -32,7 +38,7 @@
             {% endif %}
             <div class="row">
                 <h4 style="margin-left: 15px;"><strong>Import eventlog file</strong></h4>
-                <form method="POST" enctype="multipart/form-data" action="{% url 'cmdlines' %}"> 
+                <form method="POST" enctype="multipart/form-data" action="{% url 'cmdlines' %}" id="form_file"> 
                     {% csrf_token %} 
                     <div class="col-md-6" style="padding-left: 20px;">
                         <div class="row">
@@ -52,7 +58,7 @@
 
             <div class="row" style="padding-top: 20px;">
                 <div class="col-md-6 ">
-                    <h4><strong>Import eventlog files from directory</strong>
+                    <h4><strong>Eventlogs from existing build directory: </strong>
                         <a href="#" data-toggle="tooltip" title="{{dir}}">
                             <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-info-circle" viewBox="0 0 16 16" data-toggle="tooltip">
                                 <path d="M8 15A7 7 0 1 1 8 1a7 7 0 0 1 0 14m0 1A8 8 0 1 0 8 0a8 8 0 0 0 0 16"/>
@@ -78,7 +84,11 @@
                                     <td class="col-md-6 align-middle" style="vertical-align: middle;">
                                         {% if file.imported == True and file.build_id is not None %}
                                             <a href="{% url 'builddashboard' file.build_id %}">Build Details</a>
-                                        {%else %}
+                                        {% elif request.session.file == file.name or request.session.all_builds %}
+                                            <a data-toggle="tooltip" title="Build in progress">
+                                                <span class="glyphicon glyphicon-upload" style="font-size: 18px; color:grey"></span>
+                                            </a>
+                                        {%else%}
                                             <a onclick="_ajax_update('{{file.name}}', false, '{{dir}}')" data-toggle="tooltip" title="Import File">
                                                 <span class="glyphicon glyphicon-upload" style="font-size: 18px;"></span>
                                             </a>
@@ -160,11 +170,26 @@ $(function () {
 
 
 $("#id_eventlog_file").change(function(){
-    console.log($('#file_import'))
     $('#file_import').prop("disabled", false);
     $('#file_import').addClass('btn-primary')
     $('#file_import').removeClass('btn-default')
 })
+
+$(document).ajaxStart(function(){
+    $('#overlay').removeClass('hide');
+    window.setTimeout(  
+        function() {  
+            window.location = '/toastergui/builds/'
+        }, 10000)
+});
+
+$( "#form_file").on( "submit", function( event ) {
+    $('#overlay').removeClass('hide');
+    window.setTimeout(  
+        function() {  
+            window.location = '/toastergui/builds/'
+        }, 10000)
+});
 
 </script>
 

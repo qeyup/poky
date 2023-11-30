@@ -2061,6 +2061,10 @@ class CommandLineBuilds(TemplateView):
         else:
             context['files'] = []
             context['dir'] = ''
+        
+        # enable session variable
+        if not self.request.session.get('file'):
+            self.request.session['file'] = ""
 
         context['form'] = LoadFileForm()
         context['project_enable'] = project_enable
@@ -2073,6 +2077,12 @@ class CommandLineBuilds(TemplateView):
         imported_files = EventLogsImports.objects.all()
         try:
             if all_files == 'true':
+
+                # use of session variable to deactivate icon for builds in progress
+                request.session['all_builds'] = True
+                request.session.modified = True
+                request.session.save()
+
                 files = ast.literal_eval(request.POST.get('file'))
                 for file in files:
                     if imported_files.filter(name=file.get('name')).exists():
@@ -2095,6 +2105,12 @@ class CommandLineBuilds(TemplateView):
                 else:
                     file = request.POST.get('file')
 
+                # use of session variable to deactivate icon for build in progress 
+                request.session['file'] = file
+                request.session['all_builds'] = False
+                request.session.modified = True
+                request.session.save()
+
                 if imported_files.filter(name=file).exists():
                     imported_files.filter(name=file)[0].imported = True
                 else: 
@@ -2116,6 +2132,7 @@ class CommandLineBuilds(TemplateView):
                     event_log_import = EventLogsImports.objects.create(name=file, imported=True)
                     event_log_import.build_id = Build.objects.last().id
                     event_log_import.save()
+                    request.session['file'] = ""
         except json.decoder.JSONDecodeError:
             messages.add_message(
                 self.request,

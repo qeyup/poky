@@ -6,24 +6,36 @@
 # SPDX-License-Identifier: GPL-2.0-only
 #
 
+import ast
 import re
+import pickle
+import codecs
+import subprocess
+
+import bb.cooker
+from bb.ui import toasterui
 
 from django.db.models import F, Q, Sum
 from django.db import IntegrityError
-from django.shortcuts import render, redirect, get_object_or_404
+from django.shortcuts import render, redirect, get_object_or_404, HttpResponseRedirect
 from django.utils.http import urlencode
 from orm.models import Build, Target, Task, Layer, Layer_Version, Recipe
 from orm.models import LogMessage, Variable, Package_Dependency, Package
 from orm.models import Task_Dependency, Package_File
 from orm.models import Target_Installed_Package, Target_File
 from orm.models import TargetKernelFile, TargetSDKFile, Target_Image_File
-from orm.models import BitbakeVersion, CustomImageRecipe
+from orm.models import BitbakeVersion, CustomImageRecipe, EventLogsImports
 
 from django.urls import reverse, resolve
+from django.contrib import messages
+
 from django.core.exceptions import ObjectDoesNotExist
+from django.core.files.storage import FileSystemStorage
+from django.core.files.uploadedfile import InMemoryUploadedFile, TemporaryUploadedFile
 from django.core.paginator import Paginator, EmptyPage, PageNotAnInteger
 from django.http import HttpResponseNotFound, JsonResponse
 from django.utils import timezone
+from django.views.generic import TemplateView
 from datetime import timedelta, datetime
 from toastergui.templatetags.projecttags import json as jsonfilter
 from decimal import Decimal
@@ -31,6 +43,10 @@ import json
 import os
 from os.path import dirname
 import mimetypes
+
+from toastergui.forms import LoadFileForm
+
+from collections import namedtuple
 
 import logging
 
@@ -41,6 +57,7 @@ logger = logging.getLogger("toaster")
 # Project creation and managed build enable
 project_enable = ('1' == os.environ.get('TOASTER_BUILDSERVER'))
 is_project_specific = ('1' == os.environ.get('TOASTER_PROJECTSPECIFIC'))
+import_page = False
 
 class MimeTypeFinder(object):
     # setting this to False enables additional non-standard mimetypes
@@ -1940,3 +1957,170 @@ if True:
         except (ObjectDoesNotExist, IOError):
             return toaster_render(request, "unavailable_artifact.html")
 
+class EventPlayer:
+    """Emulate a connection to a bitbake server."""
+
+    def __init__(self, eventfile, variables):
+        self.eventfile = eventfile
+        self.variables = variables
+        self.eventmask = []
+
+    def waitEvent(self, _timeout):
+        """Read event from the file."""
+        line = self.eventfile.readline().strip()
+        if not line:
+            return
+        try:
+            event_str = json.loads(line)['vars'].encode('utf-8')
+            event = pickle.loads(codecs.decode(event_str, 'base64'))
+            event_name = "%s.%s" % (event.__module__, event.__class__.__name__)
+            if event_name not in self.eventmask:
+                return
+            return event
+        except ValueError as err:
+            print("Failed loading ", line)
+            raise err
+
+    def runCommand(self, command_line):
+        """Emulate running a command on the server."""
+        name = command_line[0]
+
+        if name == "getVariable":
+            var_name = command_line[1]
+            variable = self.variables.get(var_name)
+            if variable:
+                return variable['v'], None
+            return None, "Missing variable %s" % var_name
+
+        elif name == "getAllKeysWithFlags":
+            dump = {}
+            flaglist = command_line[1]
+            for key, val in self.variables.items():
+                try:
+                    if not key.startswith("__"):
+                        dump[key] = {
+                            'v': val['v'],
+                            'history' : val['history'],
+                        }
+                        for flag in flaglist:
+                            dump[key][flag] = val[flag]
+                except Exception as err:
+                    print(err)
+            return (dump, None)
+
+        elif name == 'setEventMask':
+            self.eventmask = command_line[-1]
+            return True, None
+
+        else:
+            raise Exception("Command %s not implemented" % command_line[0])
+
+    def getEventHandle(self):
+        """
+        This method is called by toasterui.
+        The return value is passed to self.runCommand but not used there.
+        """
+        pass
+
+
+class CommandLineBuilds(TemplateView):
+    model = EventLogsImports
+    template_name = 'command_line_builds.html'
+
+    def get_context_data(self, **kwargs):
+        context = super(CommandLineBuilds, self).get_context_data(**kwargs)
+        #get value from BB_DEFAULT_EVENTLOG defined in bitbake.conf
+        eventlog = subprocess.check_output(['bitbake-getvar', 'BB_DEFAULT_EVENTLOG', '--value'])
+        if eventlog:
+            logs_dir = os.path.dirname(eventlog.decode().strip('\n'))
+            files = os.listdir(logs_dir)
+            imported_files = EventLogsImports.objects.all()
+            files_list = []
+
+            # Filter files that end with ".json"
+            event_files = [file for file in files if file.endswith(".json")]
+
+            #build dict for template using db data
+            for event_file in event_files:
+                if imported_files.filter(name=event_file):
+                    files_list.append({
+                        'name': event_file,
+                        'imported': True,
+                        'build_id': imported_files.filter(name=event_file)[0].build_id
+                    })
+                else:
+                    files_list.append({
+                        'name': event_file,
+                        'imported': False,
+                        'build_id': None
+                    })
+                    context['import_all'] = True
+
+            context['files'] = files_list
+            context['dir'] = logs_dir
+        else:
+            context['files'] = []
+            context['dir'] = ''
+
+        context['form'] = LoadFileForm()
+        context['project_enable'] = project_enable
+        return context
+
+    def post(self, request, **kwargs):
+        logs_dir = request.POST.get('dir')
+        all_files =  request.POST.get('all')
+
+        imported_files = EventLogsImports.objects.all()
+        try:
+            if all_files == 'true':
+                files = ast.literal_eval(request.POST.get('file'))
+                for file in files:
+                    if imported_files.filter(name=file.get('name')).exists():
+                        imported_files.filter(name=file.get('name'))[0].imported = True
+                    else:
+                        with open("{}/{}".format(logs_dir, file.get('name'))) as eventfile:
+                            # load variables from the first line
+                            variables = json.loads(eventfile.readline().strip())['allvariables']
+
+                            params = namedtuple('ConfigParams', ['observe_only'])(True)
+                            player = EventPlayer(eventfile, variables)
+
+                            toasterui.main(player, player, params)
+                        event_log_import = EventLogsImports.objects.create(name=file.get('name'), imported=True)
+                        event_log_import.build_id = Build.objects.last().id
+                        event_log_import.save()
+            else:
+                if self.request.FILES.get('eventlog_file'):
+                    file = self.request.FILES['eventlog_file']
+                else:
+                    file = request.POST.get('file')
+
+                if imported_files.filter(name=file).exists():
+                    imported_files.filter(name=file)[0].imported = True
+                else: 
+                    if isinstance(file, InMemoryUploadedFile) or isinstance(file, TemporaryUploadedFile):
+                        variables = json.loads(file.readline().strip())['allvariables']
+                        params = namedtuple('ConfigParams', ['observe_only'])(True)
+                        player = EventPlayer(file, variables)
+                        if not os.path.exists('{}/{}'.format(logs_dir, file.name)):
+                            fs = FileSystemStorage(location=logs_dir)
+                            fs.save(file.name, file)
+                        toasterui.main(player, player, params)
+                    else:
+                        with open("{}/{}".format(logs_dir, file)) as eventfile:
+                            # load variables from the first line
+                            variables = json.loads(eventfile.readline().strip())['allvariables']
+                            params = namedtuple('ConfigParams', ['observe_only'])(True)
+                            player = EventPlayer(eventfile, variables)
+                            toasterui.main(player, player, params)
+                    event_log_import = EventLogsImports.objects.create(name=file, imported=True)
+                    event_log_import.build_id = Build.objects.last().id
+                    event_log_import.save()
+        except json.decoder.JSONDecodeError:
+            messages.add_message(
+                self.request,
+                messages.SUCCESS,
+                "The file content is not in the correct format. Update file content or upload a different file."
+            )
+            return HttpResponseRedirect("/toastergui/cmdline/")
+        return HttpResponseRedirect('/toastergui/builds/')
